@@ -1,4 +1,4 @@
 {
   "tailwindCSS.experimental.configFile": "packages/ui/src/styles/globals.css",
-  "python.analysis.extraPaths": ["./apps/api"]
+  "python.analysis.extraPaths": ["./apps/api", "./apps/api/app"]
 }
