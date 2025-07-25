@@ -57,62 +57,67 @@ class EncryptionService:
     def encrypt(
         self,
         data: bytes,
-        algorithm: EncryptionAlgorithm,
+        algorithms: list[EncryptionAlgorithm],
         key: Optional[bytes] = None,
         mode: Optional[EncryptionMode] = None,
         key_size: Optional[int] = None,
         hash_settings: Optional[HashSettings] = None
     ) -> EncryptionResult:
-        """Encrypt data using specified algorithm"""
+        """Encrypt data using specified algorithms"""
         
         metadata = {}
-        if hash_settings:
-            hash_result = self.hashing_service.hash_data(
-                data=data,
+        if hash_settings and key:
+            hash_result = self.hashing_service.hash(
+                data=key,
                 algorithm=hash_settings.algorithm,
-                key=hash_settings.key,
                 output_length=hash_settings.output_length,
                 custom=hash_settings.custom
             )
-            data = hash_result.hash_value
+            key = hash_result.hash_value
             metadata['hash'] = hash_result.dict()
 
-        if algorithm not in self.supported_algorithms:
-            raise UnsupportedAlgorithmException(algorithm.value)
-        
-        try:
-            encryption_result = self.supported_algorithms[algorithm](
-                data, key, mode, key_size
-            )
-            if encryption_result.metadata:
-                encryption_result.metadata.update(metadata)
-            else:
-                encryption_result.metadata = metadata
-            return encryption_result
-        except Exception as e:
-            raise EncryptionException(f"Encryption failed: {str(e)}")
+        for algorithm in algorithms:
+            if algorithm not in self.supported_algorithms:
+                raise UnsupportedAlgorithmException(algorithm.value)
+            
+            try:
+                encryption_result = self.supported_algorithms[algorithm](
+                    data, key, mode, key_size
+                )
+                data = encryption_result.encrypted_data
+                if encryption_result.metadata:
+                    metadata.update(encryption_result.metadata)
+            except Exception as e:
+                raise EncryptionException(f"Encryption failed: {str(e)}")
+
+        encryption_result.metadata = metadata
+        return encryption_result
     
     def decrypt(
         self,
         encrypted_data: bytes,
         key: bytes,
-        algorithm: EncryptionAlgorithm,
+        algorithms: list[EncryptionAlgorithm],
         mode: Optional[EncryptionMode] = None,
         iv: Optional[bytes] = None,
         nonce: Optional[bytes] = None,
         tag: Optional[bytes] = None
     ) -> DecryptionResult:
-        """Decrypt data using specified algorithm"""
+        """Decrypt data using specified algorithms"""
         
-        if algorithm not in self.supported_algorithms:
-            raise UnsupportedAlgorithmException(algorithm.value)
-        
-        try:
-            return self._decrypt_data(
-                encrypted_data, key, algorithm, mode, iv, nonce, tag
-            )
-        except Exception as e:
-            raise DecryptionException(f"Decryption failed: {str(e)}")
+        for algorithm in reversed(algorithms):
+            if algorithm not in self.supported_algorithms:
+                raise UnsupportedAlgorithmException(algorithm.value)
+            
+            try:
+                decryption_result = self._decrypt_data(
+                    encrypted_data, key, algorithm, mode, iv, nonce, tag
+                )
+                encrypted_data = decryption_result.decrypted_data
+            except Exception as e:
+                raise DecryptionException(f"Decryption failed: {str(e)}")
+
+        return decryption_result
     
     def generate_key(self, algorithm: EncryptionAlgorithm, key_size: Optional[int] = None) -> bytes:
         """Generate a key for the specified algorithm"""

@@ -24,7 +24,7 @@ encryption_service = EncryptionService()
 
 class EncryptRequest(BaseModel):
     data: str
-    algorithm: EncryptionAlgorithm
+    algorithms: list[EncryptionAlgorithm]
     key: Optional[str] = None
     mode: Optional[EncryptionMode] = None
     key_size: Optional[int] = None
@@ -45,7 +45,7 @@ class EncryptResponse(BaseModel):
 class DecryptRequest(BaseModel):
     encrypted_data: str
     key: str
-    algorithm: EncryptionAlgorithm
+    algorithms: list[EncryptionAlgorithm]
     mode: Optional[EncryptionMode] = None
     iv: Optional[str] = None
     nonce: Optional[str] = None
@@ -71,7 +71,7 @@ async def encrypt_data(request: EncryptRequest):
         # Perform encryption
         result = encryption_service.encrypt(
             data=data_bytes,
-            algorithm=request.algorithm,
+            algorithms=request.algorithms,
             key=key_bytes,
             mode=request.mode,
             key_size=request.key_size,
@@ -114,7 +114,7 @@ async def decrypt_data(request: DecryptRequest):
         result = encryption_service.decrypt(
             encrypted_data=encrypted_data_bytes,
             key=key_bytes,
-            algorithm=request.algorithm,
+            algorithms=request.algorithms,
             mode=request.mode,
             iv=iv_bytes,
             nonce=nonce_bytes,

@@ -58,7 +58,7 @@ class DecryptionResult(BaseModel):
 class EncryptionRequest(BaseModel):
     """Request model for encryption operations"""
     data: bytes
-    algorithm: EncryptionAlgorithm
+    algorithms: list[EncryptionAlgorithm]
     key: Optional[bytes] = None
     mode: Optional[EncryptionMode] = None
     key_size: Optional[int] = None
@@ -69,7 +69,7 @@ class DecryptionRequest(BaseModel):
     """Request model for decryption operations"""
     encrypted_data: bytes
     key: bytes
-    algorithm: EncryptionAlgorithm
+    algorithms: list[EncryptionAlgorithm]
     mode: Optional[EncryptionMode] = None
     iv: Optional[bytes] = None
     nonce: Optional[bytes] = None
