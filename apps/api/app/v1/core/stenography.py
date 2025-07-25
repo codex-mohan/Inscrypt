@@ -7,6 +7,11 @@ import numpy as np
 import soundfile as sf
 from scipy.signal import fftconvolve
 
+from moviepy import VideoFileClip
+import cv2
+import tempfile
+import shutil
+
 try:
     from pydub import AudioSegment
 
@@ -40,14 +45,11 @@ def lsb_embed_image(
     message: bytes,
     output_path: Optional[str] = None,
 ) -> str:
-
     img = Image.open(image_path)
-    if img.mode != "RGB":
-        img = img.convert("RGB")
+    if img.mode not in {"RGB", "RGBA"}:
+        img = img.convert("RGBA")  # Ensure RGBA if not already
 
-    # Defensive: accept str or bytes
     data = message.encode() if isinstance(message, str) else message
-
     binary_message = "".join(f"{byte:08b}" for byte in data)
     binary_message += "1" * 16  # 16-bit delimiter
 
@@ -59,7 +61,7 @@ def lsb_embed_image(
         for x in range(width):
             if idx >= len(binary_message):
                 break
-            r, g, b = pixels[x, y]
+            r, g, b, a = pixels[x, y]  # Now includes alpha
             r = (r & ~1) | int(binary_message[idx])
             idx += 1
             if idx < len(binary_message):
@@ -68,21 +70,27 @@ def lsb_embed_image(
             if idx < len(binary_message):
                 b = (b & ~1) | int(binary_message[idx])
                 idx += 1
-            pixels[x, y] = (r, g, b)
+            if idx < len(binary_message) and img.mode == "RGBA":
+                a = (a & ~1) | int(binary_message[idx])  # Use alpha if available
+                idx += 1
+            pixels[x, y] = (r, g, b, a) if img.mode == "RGBA" else (r, g, b)
         else:
             continue
         break
 
+    if idx < len(binary_message):
+        raise ValueError("Image too small for LSB payload")
+
     if output_path is None:
         output_path = "embedded_" + os.path.basename(image_path)
-    img.save(output_path)
+    img.save(output_path)  # Preserves RGBA if original was RGBA
     return output_path
 
 
 def lsb_extract_image(image_path: str) -> bytes:
     img = Image.open(image_path)
-    if img.mode != "RGB":
-        img = img.convert("RGB")
+    if img.mode not in {"RGB", "RGBA"}:
+        img = img.convert("RGBA")
 
     pixels = img.load()
     width, height = img.size
@@ -90,32 +98,30 @@ def lsb_extract_image(image_path: str) -> bytes:
 
     for y in range(height):
         for x in range(width):
-            r, g, b = pixels[x, y]
-            bits.extend([r & 1, g & 1, b & 1])
+            if img.mode == "RGBA":
+                r, g, b, a = pixels[x, y]
+                bits.extend([r & 1, g & 1, b & 1, a & 1])  # Include alpha
+            else:
+                r, g, b = pixels[x, y]
+                bits.extend([r & 1, g & 1, b & 1])
 
-    # Join bits into one long string
     bit_str = "".join(map(str, bits))
-
-    # Locate the 16-bit delimiter
     delim = bit_str.find("1" * 16)
     if delim == -1:
         return b""
 
     bit_str = bit_str[:delim]
-
-    # Pad to multiple of 8
     if len(bit_str) % 8:
         bit_str = bit_str[: -(len(bit_str) % 8)]
 
-    # Pack bits directly into bytes
-    data = bytes(int(bit_str[i : i + 8], 2) for i in range(0, len(bit_str), 8))
-    return data
+    return bytes(int(bit_str[i : i + 8], 2) for i in range(0, len(bit_str), 8))
 
 
 # ------------------------------------------------------------------
-# Audio / Video (place-holders) now also accept output_path
+# Audio Part
 # ------------------------------------------------------------------
-# Helpers ----------------------------------------------------
+
+
 def _load_audio_any(path: str) -> Tuple[np.ndarray, int]:
     """
     Return (samples, samplerate) as float32 mono array.
@@ -305,14 +311,189 @@ def extract_message_from_audio(audio_path: str, technique: str) -> bytes:
         raise NotImplementedError(f"Audio technique '{technique}' not implemented.")
 
 
+# ------------------------ Video LSB helpers ---------------------------- #
+def _video_lsb_embed(
+    frames: list[np.ndarray],
+    message: bytes,
+) -> list[np.ndarray]:
+    """Embed message into the LSB of the first frame(s)."""
+    data = message.encode() if isinstance(message, str) else message
+    bit_str = "".join(f"{b:08b}" for b in data) + "1" * 16
+    bits = [int(b) for b in bit_str]
+
+    out_frames = []
+    idx = 0
+    for frm in frames:
+        if idx >= len(bits):
+            out_frames.append(frm)
+            continue
+
+        # flatten first channel of first frame
+        flat = frm[:, :, 0].ravel()
+        for i in range(min(len(bits) - idx, flat.size)):
+            flat[i] = (flat[i] & ~1) | bits[idx + i]
+        idx += flat.size
+
+        # put modified pixels back
+        frm[:, :, 0] = flat.reshape(frm.shape[:2])
+        out_frames.append(frm)
+
+    if idx < len(bits):
+        raise ValueError("Video too short for LSB payload")
+    return out_frames
+
+
+def _video_lsb_extract(frames: list[np.ndarray]) -> bytes:
+    """Extract LSB bits from the first sufficient frames."""
+    bits = []
+    for frm in frames:
+        bits.extend(frm[:, :, 0].ravel() & 1)
+        # stop early if we already have enough
+        bit_str = "".join(map(str, bits))
+        delim = bit_str.find("1" * 16)
+        if delim != -1:
+            break
+    else:
+        return b""
+
+    bit_str = bit_str[:delim]
+    if len(bit_str) % 8:
+        bit_str = bit_str[: -(len(bit_str) % 8)]
+    return bytes(int(bit_str[i : i + 8], 2) for i in range(0, len(bit_str), 8))
+
+
+# ------------------------ Motion-Vector helpers ------------------------ #
+def _video_mv_embed(
+    cap: cv2.VideoCapture,
+    message: bytes,
+) -> list[np.ndarray]:
+    """Very small demo: encode one bit per frame by flipping the sign
+    of the first motion-vector’s x-component."""
+    data = message.encode() if isinstance(message, str) else message
+    bit_str = "".join(f"{b:08b}" for b in data) + "1" * 8
+    bits = [int(b) for b in bit_str]
+
+    frames = []
+    ret, prev = cap.read()
+    if not ret:
+        raise ValueError("Empty video")
+
+    prev_gray = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
+    hsv = np.zeros_like(prev)
+    hsv[..., 1] = 255
+
+    for bit in bits:
+        ret, frame = cap.read()
+        if not ret:
+            raise ValueError("Video too short for MotionVector payload")
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        flow = cv2.calcOpticalFlowPyrLK(prev_gray, gray, None, None, winSize=(15, 15))[
+            0
+        ]
+
+        if flow is not None and len(flow) > 0:
+            # flip sign of first vector’s x component to encode bit
+            flow[0][0][0] = abs(flow[0][0][0]) * (1 if bit else -1)
+
+        frames.append(frame)
+        prev_gray = gray
+
+    # copy remaining frames unchanged
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frames.append(frame)
+    return frames
+
+
+def _video_mv_extract(cap: cv2.VideoCapture) -> bytes:
+    """Decode one bit per frame from the sign of the first motion-vector."""
+    bits = []
+    ret, prev = cap.read()
+    if not ret:
+        return b""
+
+    prev_gray = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        flow = cv2.calcOpticalFlowPyrLK(prev_gray, gray, None, None, winSize=(15, 15))[
+            0
+        ]
+        bit = 0
+        if flow is not None and len(flow) > 0 and flow[0][0][0] >= 0:
+            bit = 1
+        bits.append(bit)
+        prev_gray = gray
+
+    bit_str = "".join(map(str, bits))
+    delim = bit_str.find("1" * 8)
+    if delim == -1:
+        return b""
+    return bytes(int(bit_str[:delim], 2))
+
+
+# ------------------------ Public video wrappers ------------------------ #
 def hide_message_in_video(
     video_path: str,
     message: bytes,
     technique: str,
     output_path: Optional[str] = None,
 ) -> str:
-    raise NotImplementedError("Video steganography not implemented.")
+    if technique.lower() == "lsb":
+        op = _video_lsb_embed
+    elif technique.lower() == "motionvector":
+        op = _video_mv_embed
+    else:
+        raise NotImplementedError(f"Video technique '{technique}' not implemented.")
+
+    if output_path is None:
+        base = os.path.splitext(os.path.basename(video_path))[0]
+        output_path = f"embedded_{base}.mp4"
+
+    # 1. load frames (moviepy)
+    clip = VideoFileClip(video_path)
+    frames = [cv2.cvtColor(np.array(f), cv2.COLOR_RGB2BGR) for f in clip.iter_frames()]
+
+    # 2. embed
+    if technique.lower() == "lsb":
+        new_frames = op(frames, message)
+    else:
+        cap = cv2.VideoCapture(video_path)
+        new_frames = op(cap, message)
+        cap.release()
+
+    # 3. save new video
+    height, width, _ = new_frames[0].shape
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(output_path, fourcc, clip.fps, (width, height))
+    for frm in new_frames:
+        out.write(frm)
+    out.release()
+
+    # copy audio back (moviepy keeps it easy)
+    if clip.audio:
+        final = VideoFileClip(output_path).set_audio(clip.audio)
+        final.write_videofile(output_path, codec="libx264", audio_codec="aac")
+    return output_path
 
 
 def extract_message_from_video(video_path: str, technique: str) -> bytes:
-    raise NotImplementedError("Video steganography not implemented.")
+    if technique.lower() == "lsb":
+        clip = VideoFileClip(video_path)
+        frames = [
+            cv2.cvtColor(np.array(f), cv2.COLOR_RGB2BGR) for f in clip.iter_frames()
+        ]
+        return _video_lsb_extract(frames)
+    elif technique.lower() == "motionvector":
+        cap = cv2.VideoCapture(video_path)
+        data = _video_mv_extract(cap)
+        cap.release()
+        return data
+    else:
+        raise NotImplementedError(f"Video technique '{technique}' not implemented.")
