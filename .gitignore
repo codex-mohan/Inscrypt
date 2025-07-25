@@ -329,3 +329,4 @@ Dockerfile.local
 
 # IDE ingnore list
 .kilocode
+.roo
