@@ -227,11 +227,15 @@ def decrypt_data(
 
     if encryption_layers is not None:
         # Caller supplied layer order explicitly
+
+        print(f"encryption layers: {encryption_layers}")
+        print(f"codebook: {codebook}")
         if codebook is not None:
-            raise ValueError("Provide either encryption_layers OR codebook, not both.")
-        layers = encryption_layers
-        nonces_b64: Dict[str, str] = {}
-        tags_b64: Dict[str, str] = {}
+            # Prefer the code book
+            layers = codebook["layers"]
+            hash_name = codebook["hash"]
+            nonces_b64 = codebook["nonces"]
+            tags_b64 = codebook["tags"]
     elif codebook is not None:
         # Use the stored codebook
         layers = codebook["layers"]

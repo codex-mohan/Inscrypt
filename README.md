@@ -116,6 +116,10 @@ Contributions are welcome! Please refer to the contributing guidelines for more 
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
+## 🧑🏻‍🤝‍🧑🏻 Team
+
+Group No. 32: K-Means Krew
+
 ## 👨‍💻 Author
 
 - Mohana Krishna - ID: 23BAI10630

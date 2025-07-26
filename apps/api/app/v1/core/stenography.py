@@ -3,7 +3,7 @@ import os
 from PIL import Image
 from typing import Optional, Tuple
 import cv2
-from moviepy.editor import VideoFileClip
+from moviepy import VideoFileClip
 import soundfile as sf
 from scipy.signal import fftconvolve
 
