@@ -54,16 +54,6 @@ The project is structured as a monorepo using Turbo Repo, featuring:
 - **Backend:** A FastAPI Python server.
 - **Frontend:** A Next.js based frontend.
 
-## 📚 Dataset
-
-The project utilizes a dataset of "cover" files for steganography operations:
-
-- **Images (PNG):** 10 sample PNG images.
-- **Audio (MP3):** 5 sample MP3 audio files.
-- **Video (MP4):** 5 sample MP4 video files.
-
-These files serve as carriers for encrypted secret messages.
-
 ## 🛠️ Setup and Running Instructions
 
 ### Prerequisites
