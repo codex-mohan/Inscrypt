@@ -15,6 +15,10 @@ except ImportError:
     _HAS_PYDUB = False
 
 
+# Magic number to identify our steganographic data
+STEGO_MAGIC = b"INSCRYPT_STEGO"
+
+
 # Image LSB
 def hide_message_in_image(
     image_path: str, message: bytes, technique: str, output_path: Optional[str] = None
@@ -37,8 +41,12 @@ def lsb_embed_image(
     if img.mode not in {"RGB", "RGBA"}:
         img = img.convert("RGBA")
 
-    data = message.encode() if isinstance(message, str) else message
-    binary_message = "".join(f"{byte:08b}" for byte in data) + "1" * 16
+    message_to_embed = STEGO_MAGIC + message
+    # Prepend message length to the message
+    message_len_bytes = len(message_to_embed).to_bytes(4, "big")
+    binary_message = "".join(
+        f"{byte:08b}" for byte in message_len_bytes + message_to_embed
+    )
 
     pixels = img.load()
     width, height = img.size
@@ -48,9 +56,14 @@ def lsb_embed_image(
         for x in range(width):
             if idx >= len(binary_message):
                 break
-            r, g, b, a = pixels[x, y]
-            r = (r & ~1) | int(binary_message[idx])
-            idx += 1
+            if img.mode == "RGBA":
+                r, g, b, a = pixels[x, y]
+            else:
+                r, g, b = pixels[x, y]
+
+            if idx < len(binary_message):
+                r = (r & ~1) | int(binary_message[idx])
+                idx += 1
             if idx < len(binary_message):
                 g = (g & ~1) | int(binary_message[idx])
                 idx += 1
@@ -60,6 +73,7 @@ def lsb_embed_image(
             if idx < len(binary_message) and img.mode == "RGBA":
                 a = (a & ~1) | int(binary_message[idx])
                 idx += 1
+            
             pixels[x, y] = (r, g, b, a) if img.mode == "RGBA" else (r, g, b)
         else:
             continue
@@ -70,7 +84,11 @@ def lsb_embed_image(
 
     if output_path is None:
         output_path = "embedded_" + os.path.basename(image_path)
-    img.save(output_path)
+    # Ensure output is PNG to prevent lossy compression issues
+    base, _ = os.path.splitext(output_path)
+    output_path = base + ".png"
+    
+    img.save(output_path, "PNG")
     return output_path
 
 
@@ -81,27 +99,45 @@ def lsb_extract_image(image_path: str) -> bytes:
 
     pixels = img.load()
     width, height = img.size
-    bits = []
 
-    for y in range(height):
-        for x in range(width):
-            if img.mode == "RGBA":
-                r, g, b, a = pixels[x, y]
-                bits.extend([r & 1, g & 1, b & 1, a & 1])
-            else:
-                r, g, b = pixels[x, y]
-                bits.extend([r & 1, g & 1, b & 1])
+    bit_iterator = iter(
+        (pixel_val & 1)
+        for y in range(height)
+        for x in range(width)
+        for pixel_val in pixels[x, y]
+    )
 
-    bit_str = "".join(map(str, bits))
-    delim = bit_str.find("1" * 16)
-    if delim == -1:
+    def read_bits(n):
+        # Helper to read n bits from the iterator
+        return "".join(str(next(bit_iterator)) for _ in range(n))
+
+    try:
+        # Read the 32-bit length prefix
+        len_bits = read_bits(32)
+        message_len = int(len_bits, 2)
+
+        # Sanity check the message length
+        max_len = (width * height * len(img.getbands()) - 32) // 8
+        if not (0 < message_len <= max_len):
+            return b""  # Invalid length, not a stego image
+
+        # Read the message itself
+        message_bits = read_bits(message_len * 8)
+
+        # Convert bit string to bytes
+        extracted_bytes = bytes(
+            int(message_bits[i : i + 8], 2) for i in range(0, len(message_bits), 8)
+        )
+
+        # Check for magic number
+        if extracted_bytes.startswith(STEGO_MAGIC):
+            return extracted_bytes[len(STEGO_MAGIC) :]
+        else:
+            return b""  # Not a valid stego file
+
+    except (StopIteration, ValueError):
+        # If image ends prematurely or bits are not valid int
         return b""
-
-    bit_str = bit_str[:delim]
-    if len(bit_str) % 8:
-        bit_str = bit_str[: -(len(bit_str) % 8)]
-
-    return bytes(int(bit_str[i : i + 8], 2) for i in range(0, len(bit_str), 8))
 
 
 # Audio Part
@@ -131,7 +167,13 @@ def _save_audio_any(path: str, samples: np.ndarray, sr: int) -> None:
 # Audio LSB helpers
 def _lsb_embed(samples: np.ndarray, message: bytes) -> np.ndarray:
     int16 = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
-    bit_stream = "".join(f"{b:08b}" for b in message) + "1" * 16
+    
+    message_to_embed = STEGO_MAGIC + message
+    message_len_bytes = len(message_to_embed).to_bytes(4, "big")
+    bit_stream = "".join(
+        f"{b:08b}" for b in message_len_bytes + message_to_embed
+    )
+
     if len(bit_stream) > len(int16):
         raise ValueError("Audio too short for LSB payload")
 
@@ -143,17 +185,30 @@ def _lsb_embed(samples: np.ndarray, message: bytes) -> np.ndarray:
 
 def _lsb_extract(samples: np.ndarray) -> bytes:
     int16 = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
-    bits = "".join(str(v & 1) for v in int16)
 
-    delim = bits.find("1" * 16)
-    if delim == -1:
+    # Extract length (32 bits)
+    if len(int16) < 32:
+        return b""
+    len_bits = "".join(str(v & 1) for v in int16[:32])
+    message_len = int(len_bits, 2)
+
+    # Sanity check
+    max_len = (len(int16) - 32) // 8
+    if not (0 < message_len <= max_len):
         return b""
 
-    bits = bits[:delim]
-    if len(bits) % 8:
-        bits = bits[: -(len(bits) % 8)]
+    # Extract message
+    total_bits_to_extract = message_len * 8
+    if len(int16) < 32 + total_bits_to_extract:
+        return b""
 
-    return bytes(int(bits[i : i + 8], 2) for i in range(0, len(bits), 8))
+    bits = "".join(str(v & 1) for v in int16[32 : 32 + total_bits_to_extract])
+    extracted_bytes = bytes(int(bits[i : i + 8], 2) for i in range(0, len(bits), 8))
+
+    if extracted_bytes.startswith(STEGO_MAGIC):
+        return extracted_bytes[len(STEGO_MAGIC) :]
+    else:
+        return b""
 
 
 # Echo-Hiding
@@ -285,8 +340,11 @@ def extract_message_from_audio(audio_path: str, technique: str) -> bytes:
 
 # Video LSB helpers
 def _video_lsb_embed(frames: list[np.ndarray], message: bytes) -> list[np.ndarray]:
-    data = message.encode() if isinstance(message, str) else message
-    bit_str = "".join(f"{byte:08b}" for byte in data) + "1" * 16
+    message_to_embed = STEGO_MAGIC + message
+    message_len_bytes = len(message_to_embed).to_bytes(4, "big")
+    bit_str = "".join(
+        f"{byte:08b}" for byte in message_len_bytes + message_to_embed
+    )
     bits = [int(b) for b in bit_str]
 
     out_frames = []
@@ -321,32 +379,45 @@ def _video_lsb_embed(frames: list[np.ndarray], message: bytes) -> list[np.ndarra
 
 
 def _video_lsb_extract(frames: list[np.ndarray]) -> bytes:
-    bits = []
-    for frm in frames:
-        if frm.ndim == 3 and frm.shape[2] > 0:
-            extracted_values = frm.ravel()
-        else:
-            extracted_values = frm.ravel()
+    # Flatten all frames into a single stream of pixels
+    pixel_stream = np.concatenate([frm.ravel() for frm in frames])
 
-        bits.extend(extracted_values & 1)
+    # Extract bits from the pixel stream
+    extracted_bits = (pixel_stream & 1).tolist()
 
-        bit_str = "".join(map(str, bits))
-        delim = bit_str.find("1" * 16)
-        if delim != -1:
-            break
-    else:
+    # Extract length (32 bits)
+    if len(extracted_bits) < 32:
+        return b""
+    len_bit_str = "".join(map(str, extracted_bits[:32]))
+    message_len = int(len_bit_str, 2)
+
+    # Sanity check
+    max_len = (len(extracted_bits) - 32) // 8
+    if not (0 < message_len <= max_len):
         return b""
 
-    bit_str = bit_str[:delim]
-    if len(bit_str) % 8:
-        bit_str = bit_str[: -(len(bit_str) % 8)]
-    return bytes(int(bit_str[i : i + 8], 2) for i in range(0, len(bit_str), 8))
+    # Extract message
+    start_index = 32
+    end_index = 32 + (message_len * 8)
+    if len(extracted_bits) < end_index:
+        return b""
+
+    message_bit_str = "".join(map(str, extracted_bits[start_index:end_index]))
+
+    extracted_bytes = bytes(
+        int(message_bit_str[i : i + 8], 2)
+        for i in range(0, len(message_bit_str), 8)
+    )
+
+    if extracted_bytes.startswith(STEGO_MAGIC):
+        return extracted_bytes[len(STEGO_MAGIC) :]
+    else:
+        return b""
 
 
 # Motion-Vector helpers
 def _video_mv_embed(cap: cv2.VideoCapture, message: bytes) -> list[np.ndarray]:
-    data = message.encode() if isinstance(message, str) else message
-    bit_str = "".join(f"{b:08b}" for b in data) + "1" * 8
+    bit_str = "".join(f"{b:08b}" for b in message) + "1" * 8
     bits_to_embed = [int(b) for b in bit_str]
 
     frames = []

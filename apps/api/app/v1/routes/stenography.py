@@ -165,28 +165,39 @@ async def embed_message(
         output_file_name = (
             f"/tmp/output_{uuid.uuid4().hex}.{file.filename.split('.')[-1]}"
         )
-        # 1.  turn encrypted bytes into base64 string
-        b64_payload = encrypted_result["encrypted_data"]
+        
+        # Serialize codebook and combine with encrypted data
+        codebook_json = json.dumps(encrypted_result["codebook"])
+        encrypted_data_b64 = encrypted_result["encrypted_data"]
 
-        logger.debug(f"Base64 payload: {b64_payload!r}")
+        # Use a unique, unlikely delimiter
+        delimiter = b"||CODEBOOK_DELIMITER||"
+
+        combined_payload = (
+            codebook_json.encode("utf-8")
+            + delimiter
+            + encrypted_data_b64.encode("utf-8")
+        )
+        
+        logger.debug(f"Combined payload length: {len(combined_payload)}")
 
         if file.content_type.startswith("image/"):
             output_path = hide_message_in_image(
                 temp_file_path,
-                b64_payload,  # <- bytes of base64
+                combined_payload,
                 stenographic_technique,
                 output_path=output_file_name,
             )
         elif file.content_type.startswith("audio/"):
             output_path = hide_message_in_audio(
                 temp_file_path,
-                b64_payload.encode(),
+                combined_payload,
                 stenographic_technique,
             )
         elif file.content_type.startswith("video/"):
             output_path = hide_message_in_video(
                 temp_file_path,
-                b64_payload.encode(),
+                combined_payload,
                 stenographic_technique,
             )
         else:
@@ -194,11 +205,8 @@ async def embed_message(
 
         os.remove(temp_file_path)
 
-        # The output_path from the steganography functions is the full path
-        # We need to return only the basename for the download endpoint
         return {
             "output_path": os.path.basename(output_path),
-            "codebook": encrypted_result["codebook"],
         }
     except Exception as e:
         logger.error(f"Error occurred: {e}")
@@ -210,9 +218,6 @@ async def extract_message(
     file: UploadFile = File(...),
     password: str = Form(...),
     stenographic_technique: str = Form(...),
-    codebook: Optional[str] = Form(None),
-    encryption_algos: Optional[str] = Form(None),
-    hash_function: Optional[str] = Form(None),
 ):
     try:
         logger.info(f"Received extract request for file: {file.filename}")
@@ -225,71 +230,50 @@ async def extract_message(
         with open(temp_file_path, "wb") as f:
             f.write(file.file.read())
 
-        # 2. read steganographically hidden base64 string
+        # 2. read steganographically hidden payload
         if file.content_type.startswith("image/"):
-            b64_str = extract_message_from_image(
+            combined_payload = extract_message_from_image(
                 temp_file_path, stenographic_technique
-            ).decode()
+            )
         elif file.content_type.startswith("audio/"):
-            b64_str = extract_message_from_audio(
+            combined_payload = extract_message_from_audio(
                 temp_file_path, stenographic_technique
-            ).decode()
+            )
         elif file.content_type.startswith("video/"):
-            b64_str = extract_message_from_video(
+            combined_payload = extract_message_from_video(
                 temp_file_path, stenographic_technique
-            ).decode()
+            )
         else:
             logger.error(f"Unsupported file type: {file.content_type}")
             raise HTTPException(status_code=400, detail="Unsupported file type")
 
-        logger.info("Message extracted successfully.")
+        logger.info("Payload extracted successfully.")
         os.remove(temp_file_path)
 
-        # 3. build decryption parameters -------------------------------
-        if codebook is not None:
-            # caller sent the full JSON codebook
-            cb = json.loads(codebook)
-            layers = cb["layers"]
-            hash_name = cb["hash"]
-            # reuse the stored nonces/tags as-is
-            nonces_b64 = cb.get("nonces", {})
-            tags_b64 = cb.get("tags", {})
-        elif encryption_algos is not None and hash_function is not None:
-            # caller supplied algo list + hash directly
-            layers = [a.strip() for a in encryption_algos.split(",")]
-            hash_name = hash_function
-            # no nonces/tags provided; _decrypt_layer will look for f"{algo}_{idx}"
-            nonces_b64, tags_b64 = {}, {}
-        else:
+        # 3. Separate codebook and encrypted data
+        delimiter = b"||CODEBOOK_DELIMITER||"
+        if delimiter not in combined_payload:
+            logger.error(f"Delimiter not found in payload. Payload length: {len(combined_payload)}")
+            logger.debug(f"Payload (first 100 bytes): {combined_payload[:100]!r}")
             raise HTTPException(
-                status_code=400,
-                detail="Either codebook or (encryption_algos + hash_function) must be supplied.",
+                status_code=400, detail="Invalid payload format: delimiter not found."
             )
 
-        # 4. prepare keys exactly like encrypt_data() does
-        layer_meta = {}
-        for idx, algo in enumerate(layers):
-            key_name = f"{algo}_{idx}"
-            meta = {}
-            if key_name in nonces_b64:
-                meta["nonce"] = base64.b64decode(nonces_b64[key_name])
-            if key_name in tags_b64:
-                meta["tag"] = base64.b64decode(tags_b64[key_name])
-            layer_meta[key_name] = meta
+        codebook_json_bytes, encrypted_data_b64_bytes = combined_payload.split(
+            delimiter, 1
+        )
+        codebook_json = codebook_json_bytes.decode('utf-8')
+        
+        try:
+            codebook = json.loads(codebook_json)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid codebook format.")
 
-        # 5. decrypt
+        # 4. decrypt
         decrypted_message = decrypt_data(
-            encrypted_data=b64_str.encode() + b"=" * (4 - len(b64_str.encode()) % 4),
+            encrypted_data=base64.b64decode(encrypted_data_b64_bytes),
             password=password,
-            encryption_layers=layers,
-            hash_name=hash_name,
-            codebook={
-                "layers": layers,
-                "hash": hash_name,
-                "nonces": nonces_b64,
-                "tags": tags_b64,
-            },
-            # ^ we still pass a codebook dict so decrypt_data can pick up the right keys
+            codebook=codebook,
         )
 
         logger.info("Decryption successful.")

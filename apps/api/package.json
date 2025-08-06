@@ -2,7 +2,7 @@
   "name": "inscrypt-api",
   "version": "1.0.0",
   "scripts": {
-    "dev": "uvicorn main:app --reload",
+    "dev": "uv run uvicorn main:app --reload",
     "build": "python -m build"
   }
 }

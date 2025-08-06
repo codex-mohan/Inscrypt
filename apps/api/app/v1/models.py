@@ -11,6 +11,3 @@ class EmbedRequest(BaseModel):
 class ExtractRequest(BaseModel):
     password: str = Field(..., description="The password used during the embedding process.")
     stenographic_technique: str = Field(..., description="The steganography technique used during embedding.")
-    codebook: Optional[Dict[str, Any]] = Field(None, description="The codebook generated during embedding. Contains metadata for decryption.")
-    encryption_algos: Optional[List[str]] = Field(None, description="A list of encryption algorithms used. Required if codebook is not provided.")
-    hash_function: Optional[str] = Field(None, description="The hash function used. Required if codebook is not provided.")

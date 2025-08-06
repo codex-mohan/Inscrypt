@@ -216,41 +216,21 @@ def encrypt_data(
 
 
 def decrypt_data(
-    encrypted_data: str,
+    encrypted_data: bytes,
     password: str,
-    hash_name: str,
-    encryption_layers: Optional[List[str]] = None,
-    codebook: Optional[Dict[str, Any]] = None,
+    codebook: Dict[str, Any],
 ) -> bytes:
-    if encryption_layers is None and codebook is None:
-        raise ValueError("Either encryption_layers or codebook must be supplied.")
-
-    if encryption_layers is not None:
-        # Caller supplied layer order explicitly
-
-        print(f"encryption layers: {encryption_layers}")
-        print(f"codebook: {codebook}")
-        if codebook is not None:
-            # Prefer the code book
-            layers = codebook["layers"]
-            hash_name = codebook["hash"]
-            nonces_b64 = codebook["nonces"]
-            tags_b64 = codebook["tags"]
-    elif codebook is not None:
-        # Use the stored codebook
-        layers = codebook["layers"]
-        hash_name = codebook["hash"]
-        nonces_b64 = codebook["nonces"]
-        tags_b64 = codebook["tags"]
-    else:
-        raise ValueError("Either encryption_layers or codebook must be supplied.")
+    layers = codebook["layers"]
+    hash_name = codebook["hash"]
+    nonces_b64 = codebook.get("nonces", {})
+    tags_b64 = codebook.get("tags", {})
 
     # Decode base64 metadata once
     nonces = {k: base64.b64decode(v) for k, v in nonces_b64.items()}
     tags = {k: base64.b64decode(v) for k, v in tags_b64.items()}
 
     key_material = password.encode()
-    current = base64.b64decode(encrypted_data)
+    current = encrypted_data
 
     # ------------------------------------------------------------------ #
     # Decrypt layers in reverse order                                    #
