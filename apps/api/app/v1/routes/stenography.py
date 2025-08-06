@@ -30,12 +30,12 @@ SUPPORTED_ENCRYPTION_ALGORITHMS = [
     "AES",
     "DES",
     "DES3",
-    "ChaCha20",
-    "ChaCha20_Poly1305",
-    "Blowfish",
+    "CHACHA20",
+    "CHACHA20_POLY1305",
+    "BLOWFISH",
     "ARC2",
     "ARC4",
-    "Salsa20",
+    "SALSA20",
     "CAST",
     "PKCS1_OAEP",
     "PKCS1_v1_5",
@@ -165,20 +165,20 @@ async def embed_message(
         output_file_name = (
             f"/tmp/output_{uuid.uuid4().hex}.{file.filename.split('.')[-1]}"
         )
-        
+
         # Serialize codebook and combine with encrypted data
         codebook_json = json.dumps(encrypted_result["codebook"])
         encrypted_data_b64 = encrypted_result["encrypted_data"]
 
         # Use a unique, unlikely delimiter
-        delimiter = b"||CODEBOOK_DELIMITER||"
+        delimiter = b"|~_~|INSCRYPT_DELIMITER|~_~|"
 
         combined_payload = (
             codebook_json.encode("utf-8")
             + delimiter
             + encrypted_data_b64.encode("utf-8")
         )
-        
+
         logger.debug(f"Combined payload length: {len(combined_payload)}")
 
         if file.content_type.startswith("image/"):
@@ -251,9 +251,11 @@ async def extract_message(
         os.remove(temp_file_path)
 
         # 3. Separate codebook and encrypted data
-        delimiter = b"||CODEBOOK_DELIMITER||"
+        delimiter = b"|~_~|INSCRYPT_DELIMITER|~_~|"
         if delimiter not in combined_payload:
-            logger.error(f"Delimiter not found in payload. Payload length: {len(combined_payload)}")
+            logger.error(
+                f"Delimiter not found in payload. Payload length: {len(combined_payload)}"
+            )
             logger.debug(f"Payload (first 100 bytes): {combined_payload[:100]!r}")
             raise HTTPException(
                 status_code=400, detail="Invalid payload format: delimiter not found."
@@ -262,8 +264,8 @@ async def extract_message(
         codebook_json_bytes, encrypted_data_b64_bytes = combined_payload.split(
             delimiter, 1
         )
-        codebook_json = codebook_json_bytes.decode('utf-8')
-        
+        codebook_json = codebook_json_bytes.decode("utf-8")
+
         try:
             codebook = json.loads(codebook_json)
         except json.JSONDecodeError:

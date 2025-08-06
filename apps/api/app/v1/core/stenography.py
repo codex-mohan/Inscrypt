@@ -3,13 +3,16 @@ import os
 from PIL import Image
 from typing import Optional, Tuple
 import cv2
-from moviepy import VideoFileClip
+from moviepy import ImageSequenceClip, VideoFileClip
 import soundfile as sf
 from scipy.signal import fftconvolve
 
 try:
     from pydub import AudioSegment
 
+    # Check for FFMPEG_PATH environment variable
+    if "FFMPEG_PATH" in os.environ:
+        AudioSegment.converter = os.environ["FFMPEG_PATH"]
     _HAS_PYDUB = True
 except ImportError:
     _HAS_PYDUB = False
@@ -73,7 +76,7 @@ def lsb_embed_image(
             if idx < len(binary_message) and img.mode == "RGBA":
                 a = (a & ~1) | int(binary_message[idx])
                 idx += 1
-            
+
             pixels[x, y] = (r, g, b, a) if img.mode == "RGBA" else (r, g, b)
         else:
             continue
@@ -87,7 +90,7 @@ def lsb_embed_image(
     # Ensure output is PNG to prevent lossy compression issues
     base, _ = os.path.splitext(output_path)
     output_path = base + ".png"
-    
+
     img.save(output_path, "PNG")
     return output_path
 
@@ -166,43 +169,53 @@ def _save_audio_any(path: str, samples: np.ndarray, sr: int) -> None:
 
 # Audio LSB helpers
 def _lsb_embed(samples: np.ndarray, message: bytes) -> np.ndarray:
-    int16 = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
-    
+    """Embeds message into LSB of int16 samples and returns int16 samples."""
+    if not np.issubdtype(samples.dtype, np.floating):
+        raise TypeError("Input samples for LSB embedding must be float.")
+
+    int16_samples = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+
     message_to_embed = STEGO_MAGIC + message
     message_len_bytes = len(message_to_embed).to_bytes(4, "big")
-    bit_stream = "".join(
-        f"{b:08b}" for b in message_len_bytes + message_to_embed
-    )
+    bit_stream = "".join(f"{b:08b}" for b in message_len_bytes + message_to_embed)
 
-    if len(bit_stream) > len(int16):
+    if len(bit_stream) > len(int16_samples):
         raise ValueError("Audio too short for LSB payload")
 
     for i, bit in enumerate(bit_stream):
-        int16[i] = (int16[i] & ~1) | int(bit)
+        int16_samples[i] = (int16_samples[i] & ~1) | int(bit)
 
-    return int16.astype(np.float32) / 32768.0
+    return int16_samples
 
 
 def _lsb_extract(samples: np.ndarray) -> bytes:
-    int16 = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+    if not np.issubdtype(samples.dtype, np.floating):
+        raise TypeError("Input samples for LSB extraction must be float.")
+
+    # Scale float samples in [-1.0, 1.0) to int16 range [-32768, 32767]
+    # soundfile normalizes by 32768, so we multiply to reverse it.
+    int16_samples = (samples * 32768.0).astype(np.int16)
 
     # Extract length (32 bits)
-    if len(int16) < 32:
+    if len(int16_samples) < 32:
         return b""
-    len_bits = "".join(str(v & 1) for v in int16[:32])
-    message_len = int(len_bits, 2)
+    len_bits = "".join(str(v & 1) for v in int16_samples[:32])
+    try:
+        message_len = int(len_bits, 2)
+    except ValueError:
+        return b""  # Not a valid binary number
 
     # Sanity check
-    max_len = (len(int16) - 32) // 8
+    max_len = (len(int16_samples) - 32) // 8
     if not (0 < message_len <= max_len):
         return b""
 
     # Extract message
     total_bits_to_extract = message_len * 8
-    if len(int16) < 32 + total_bits_to_extract:
+    if len(int16_samples) < 32 + total_bits_to_extract:
         return b""
 
-    bits = "".join(str(v & 1) for v in int16[32 : 32 + total_bits_to_extract])
+    bits = "".join(str(v & 1) for v in int16_samples[32 : 32 + total_bits_to_extract])
     extracted_bytes = bytes(int(bits[i : i + 8], 2) for i in range(0, len(bits), 8))
 
     if extracted_bytes.startswith(STEGO_MAGIC):
@@ -216,42 +229,20 @@ def _echo_embed(
     samples: np.ndarray,
     sr: int,
     message: bytes,
+    delay0_ms: float = 20,
+    delay1_ms: float = 30,
     echo_amp: float = 0.2,
-    delay_ms: float = 30,
 ) -> np.ndarray:
-    delay = int(sr * delay_ms / 1000)
-    echo = np.zeros_like(samples)
-    echo[delay:] = echo_amp * samples[:-delay]
+    delay0 = int(sr * delay0_ms / 1000)
+    delay1 = int(sr * delay1_ms / 1000)
 
-    bit_stream = "".join(f"{b:08b}" for b in message) + "1" * 8
-    block_size = len(samples) // len(bit_stream)
-    if block_size == 0:
-        raise ValueError("Audio too short for EchoHiding")
+    message_to_embed = STEGO_MAGIC + message
+    message_len_bytes = len(message_to_embed).to_bytes(4, "big")
+    bit_stream = "".join(f"{b:08b}" for b in message_len_bytes + message_to_embed)
 
-    stego = samples.copy()
-    for i, bit in enumerate(bit_stream):
-        start = i * block_size
-        end = min((i + 1) * block_size, len(stego))
-        if bit == "1":
-            stego[start:end] += echo[start:end]
-    return stego
-
-
-def _echo_extract(
-    samples: np.ndarray, sr: int, echo_amp: float = 0.2, delay_ms: float = 30
-) -> bytes:
-    delay = int(sr * delay_ms / 1000)
-    if delay == 0:
-        return b""
-    return b""
-
-
-# Phase-Coding
-def _phase_embed(samples: np.ndarray, sr: int, message: bytes) -> np.ndarray:
-    bit_stream = "".join(f"{b:08b}" for b in message) + "1" * 8
-    block_size = 2 ** int(np.log2(len(samples) // len(bit_stream)))
-    if block_size < 32:
-        raise ValueError("Audio too short for PhaseCoding")
+    block_size = max(delay0, delay1) * 4  # Ensure block is large enough for cepstrum
+    if len(bit_stream) * block_size > len(samples):
+        raise ValueError("Audio too short for EchoHiding payload")
 
     stego = samples.copy()
     for i, bit in enumerate(bit_stream):
@@ -259,49 +250,152 @@ def _phase_embed(samples: np.ndarray, sr: int, message: bytes) -> np.ndarray:
         end = start + block_size
         if end > len(stego):
             break
+
+        delay = delay1 if bit == "1" else delay0
+        echo = np.zeros(block_size)
+        echo[delay:] = echo_amp * stego[start : end - delay]
+        stego[start:end] += echo
+
+    return stego
+
+
+def _echo_extract(
+    samples: np.ndarray, sr: int, delay0_ms: float = 20, delay1_ms: float = 30
+) -> bytes:
+    delay0 = int(sr * delay0_ms / 1000)
+    delay1 = int(sr * delay1_ms / 1000)
+    block_size = max(delay0, delay1) * 4
+
+    bits = []
+    num_blocks = len(samples) // block_size
+
+    for i in range(num_blocks):
+        start = i * block_size
+        end = start + block_size
+        block = samples[start:end]
+
+        # Cepstrum to find echo
+        ceps = np.fft.ifft(np.log(np.abs(np.fft.fft(block)) + 1e-9)).real
+
+        peak0 = np.max(ceps[delay0 - 2 : delay0 + 3])
+        peak1 = np.max(ceps[delay1 - 2 : delay1 + 3])
+
+        if peak1 > peak0:
+            bits.append("1")
+        else:
+            bits.append("0")
+
+    bit_stream = "".join(bits)
+
+    if len(bit_stream) < 32:
+        return b""
+    len_bits = bit_stream[:32]
+    try:
+        message_len = int(len_bits, 2)
+    except ValueError:
+        return b""
+
+    max_len = (len(bit_stream) - 32) // 8
+    if not (0 < message_len <= max_len):
+        return b""
+
+    total_bits_to_extract = message_len * 8
+    if len(bit_stream) < 32 + total_bits_to_extract:
+        return b""
+
+    message_bits = bit_stream[32 : 32 + total_bits_to_extract]
+    extracted_bytes = bytes(
+        int(message_bits[i : i + 8], 2) for i in range(0, len(message_bits), 8)
+    )
+
+    if extracted_bytes.startswith(STEGO_MAGIC):
+        return extracted_bytes[len(STEGO_MAGIC) :]
+    else:
+        return b""
+
+
+def _phase_embed(samples: np.ndarray, sr: int, message: bytes) -> np.ndarray:
+    message_to_embed = STEGO_MAGIC + message
+    message_len_bytes = len(message_to_embed).to_bytes(4, "big")
+    bit_stream = "".join(f"{b:08b}" for b in message_len_bytes + message_to_embed)
+
+    block_size = 2048  # Fixed block size
+    if len(bit_stream) * block_size > len(samples):
+        raise ValueError("Audio too short for PhaseCoding payload")
+
+    stego = samples.copy()
+    for i, bit in enumerate(bit_stream):
+        start = i * block_size
+        end = start + block_size
+        if end > len(stego):
+            break
+
         block = stego[start:end]
         dft = np.fft.rfft(block)
-        if len(dft) > 0:
-            mid_freq_idx = len(dft) // 2
-            if bit == "1":
-                dft[mid_freq_idx] = np.abs(dft[mid_freq_idx]) * np.exp(
-                    1j * np.angle(dft[mid_freq_idx])
-                )
-            else:
-                dft[mid_freq_idx] = -np.abs(dft[mid_freq_idx]) * np.exp(
-                    1j * np.angle(dft[mid_freq_idx])
-                )
+
+        # Modify phase of a mid-range frequency component
+        freq_idx_to_modify = len(dft) // 4
+
+        if bit == "1":
+            dft[freq_idx_to_modify] = np.abs(dft[freq_idx_to_modify]) * np.exp(
+                1j * np.pi / 2
+            )
+        else:
+            dft[freq_idx_to_modify] = np.abs(dft[freq_idx_to_modify]) * np.exp(
+                -1j * np.pi / 2
+            )
 
         stego[start:end] = np.fft.irfft(dft, n=block_size)
+
     return stego
 
 
 def _phase_extract(samples: np.ndarray, sr: int) -> bytes:
-    bit_stream = ""
-    min_block_size = 32
-    current_samples = samples.copy()
+    block_size = 2048
+    bits = []
+    num_blocks = len(samples) // block_size
 
-    while len(current_samples) >= min_block_size:
-        block = current_samples[:min_block_size]
+    for i in range(num_blocks):
+        start = i * block_size
+        end = start + block_size
+        block = samples[start:end]
         dft = np.fft.rfft(block)
-        if len(dft) > 0:
-            mid_freq_idx = len(dft) // 2
-            if np.real(dft[mid_freq_idx]) >= 0:
-                bit_stream += "1"
-            else:
-                bit_stream += "0"
-        current_samples = current_samples[min_block_size:]
 
-    delim = bit_stream.find("1" * 8)
-    if delim == -1:
+        freq_idx_to_check = len(dft) // 4
+        angle = np.angle(dft[freq_idx_to_check])
+
+        if angle > 0:
+            bits.append("1")
+        else:
+            bits.append("0")
+
+    bit_stream = "".join(bits)
+
+    if len(bit_stream) < 32:
         return b""
-    message_bits_str = bit_stream[:delim]
-    if len(message_bits_str) % 8:
-        message_bits_str = message_bits_str[: -(len(message_bits_str) % 8)]
+    len_bits = bit_stream[:32]
+    try:
+        message_len = int(len_bits, 2)
+    except ValueError:
+        return b""
 
-    return bytes(
-        int(message_bits_str[i : i + 8], 2) for i in range(0, len(message_bits_str), 8)
+    max_len = (len(bit_stream) - 32) // 8
+    if not (0 < message_len <= max_len):
+        return b""
+
+    total_bits_to_extract = message_len * 8
+    if len(bit_stream) < 32 + total_bits_to_extract:
+        return b""
+
+    message_bits = bit_stream[32 : 32 + total_bits_to_extract]
+    extracted_bytes = bytes(
+        int(message_bits[i : i + 8], 2) for i in range(0, len(message_bits), 8)
     )
+
+    if extracted_bytes.startswith(STEGO_MAGIC):
+        return extracted_bytes[len(STEGO_MAGIC) :]
+    else:
+        return b""
 
 
 # Public audio wrappers
@@ -310,7 +404,9 @@ def hide_message_in_audio(
 ) -> str:
     samples, sr = _load_audio_any(audio_path)
     if technique.lower() == "lsb":
-        stego = _lsb_embed(samples, message)
+        stego_int16 = _lsb_embed(samples, message)
+        # Convert back to float for saving
+        stego = stego_int16.astype(np.float32) / 32768.0
     elif technique.lower() == "echohiding":
         stego = _echo_embed(samples, sr, message)
     elif technique.lower() == "phasecoding":
@@ -318,9 +414,20 @@ def hide_message_in_audio(
     else:
         raise NotImplementedError(f"Audio technique '{technique}' not implemented.")
 
+    if stego.shape[0] < samples.shape[0]:
+        stego = np.pad(stego, (0, samples.shape[0] - stego.shape[0]))
+
+    tmp_dir = "/tmp/"
+
+    if not os.path.exists(tmp_dir):
+        os.makedirs(tmp_dir)
+
     if output_path is None:
         output_path = (
-            "embedded_" + os.path.splitext(os.path.basename(audio_path))[0] + ".wav"
+            tmp_dir
+            + "embedded_"
+            + os.path.splitext(os.path.basename(audio_path))[0]
+            + ".wav"
         )
     _save_audio_any(output_path, stego, sr)
     return output_path
@@ -340,79 +447,93 @@ def extract_message_from_audio(audio_path: str, technique: str) -> bytes:
 
 # Video LSB helpers
 def _video_lsb_embed(frames: list[np.ndarray], message: bytes) -> list[np.ndarray]:
+    if not frames:
+        raise ValueError("Input frame list is empty.")
     message_to_embed = STEGO_MAGIC + message
-    message_len_bytes = len(message_to_embed).to_bytes(4, "big")
-    bit_str = "".join(
-        f"{byte:08b}" for byte in message_len_bytes + message_to_embed
-    )
-    bits = [int(b) for b in bit_str]
+    message_len_bytes = len(message_to_embed).to_bytes(8, "big")
+    bit_stream = "".join(f"{byte:08b}" for byte in message_len_bytes + message_to_embed)
+
+    bits_to_embed = np.array([int(b) for b in bit_stream], dtype=np.uint8)
+    num_bits_to_embed = len(bits_to_embed)
+
+    total_pixels = sum(frame.size for frame in frames)
+    if num_bits_to_embed > total_pixels:
+        raise ValueError("Video too short for LSB payload")
 
     out_frames = []
-    idx = 0
-    for frm in frames:
-        if idx >= len(bits):
-            out_frames.append(frm)
+    bit_idx = 0
+    for frame in frames:
+        if bit_idx >= num_bits_to_embed:
+            out_frames.append(frame)
             continue
 
-        frm_copy = frm.astype(np.int16)
+        frame_copy = frame.copy()
+        flat_frame = frame_copy.ravel()
 
-        if frm_copy.ndim == 3 and frm_copy.shape[2] > 0:
-            flat = frm_copy.ravel()
-            is_color = True
-        else:
-            flat = frm_copy.ravel()
-            is_color = False
+        embed_len = min(len(flat_frame), num_bits_to_embed - bit_idx)
+        flat_frame[:embed_len] = (flat_frame[:embed_len] & 0xFE) | bits_to_embed[
+            bit_idx : bit_idx + embed_len
+        ]
+        bit_idx += embed_len
 
-        for i in range(min(len(bits) - idx, flat.size)):
-            val = (flat[i] & ~1) | bits[idx + i]
-            flat[i] = np.clip(val, 0, 255)
-            idx += 1
+        out_frames.append(frame_copy)
 
-        if is_color:
-            out_frames.append(flat.reshape(frm_copy.shape).astype(np.uint8))
-        else:
-            out_frames.append(flat.reshape(frm_copy.shape).astype(np.uint8))
-
-    if idx < len(bits):
-        raise ValueError("Video too short for LSB payload")
     return out_frames
 
 
 def _video_lsb_extract(frames: list[np.ndarray]) -> bytes:
-    # Flatten all frames into a single stream of pixels
-    pixel_stream = np.concatenate([frm.ravel() for frm in frames])
-
-    # Extract bits from the pixel stream
-    extracted_bits = (pixel_stream & 1).tolist()
-
-    # Extract length (32 bits)
-    if len(extracted_bits) < 32:
+    if not frames:
         return b""
-    len_bit_str = "".join(map(str, extracted_bits[:32]))
-    message_len = int(len_bit_str, 2)
 
-    # Sanity check
-    max_len = (len(extracted_bits) - 32) // 8
+    # Create a generator that yields the LSB of each pixel value sequentially
+    pixel_iterator = (p & 1 for frame in frames for p in frame.ravel())
+
+    def read_bits(n):
+        bits = []
+        try:
+            for _ in range(n):
+                bits.append(str(next(pixel_iterator)))
+        except StopIteration:
+            return None  # Not enough bits in the video
+        return "".join(bits)
+
+    # 1. Read the 8-byte (64-bit) length prefix
+    len_bits_str = read_bits(64)
+    if len_bits_str is None:
+        return b""
+
+    try:
+        message_len = int(len_bits_str, 2)
+    except ValueError:
+        return b""  # Invalid binary format for length
+
+    # 2. Sanity-check the message length against the total available pixels
+    total_pixels = sum(f.size for f in frames)
+    max_len = (total_pixels - 64) // 8
     if not (0 < message_len <= max_len):
-        return b""
+        return b""  # Length is unreasonable
 
-    # Extract message
-    start_index = 32
-    end_index = 32 + (message_len * 8)
-    if len(extracted_bits) < end_index:
-        return b""
+    # 3. Read the message itself
+    message_bits_str = read_bits(message_len * 8)
+    if message_bits_str is None:
+        return b""  # Video ended before the full message could be read
 
-    message_bit_str = "".join(map(str, extracted_bits[start_index:end_index]))
+    # 4. Convert the bit string to bytes
+    try:
+        extracted_bytes = bytes(
+            int(message_bits_str[i : i + 8], 2)
+            for i in range(0, len(message_bits_str), 8)
+        )
+    except ValueError:
+        return b""  # Invalid binary format for message bytes
 
-    extracted_bytes = bytes(
-        int(message_bit_str[i : i + 8], 2)
-        for i in range(0, len(message_bit_str), 8)
-    )
-
+    # 5. Check for the magic number and return the payload
     if extracted_bytes.startswith(STEGO_MAGIC):
         return extracted_bytes[len(STEGO_MAGIC) :]
-    else:
-        return b""
+
+    return b""
+
+
 
 
 # Motion-Vector helpers
@@ -516,69 +637,89 @@ def _video_mv_extract(cap: cv2.VideoCapture) -> bytes:
 def hide_message_in_video(
     video_path: str, message: bytes, technique: str, output_path: Optional[str] = None
 ) -> str:
-    if technique.lower() == "lsb":
-        clip = VideoFileClip(video_path)
-        frames = [
-            cv2.cvtColor(np.array(f), cv2.COLOR_RGB2BGR) for f in clip.iter_frames()
-        ]
-        new_frames = _video_lsb_embed(frames, message)
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError("Could not open video file.")
 
-        if output_path is None:
-            base = os.path.splitext(os.path.basename(video_path))[0]
-            output_path = f"/tmp/embedded_{base}.mp4"
+    original_clip = None
+    final_clip = None
+    try:
+        if technique.lower() == "lsb":
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frames = []
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-        height, width, _ = new_frames[0].shape
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(output_path, fourcc, clip.fps, (width, height))
-        for frm in new_frames:
-            out.write(frm)
-        out.release()
+            if not frames:
+                raise ValueError("Could not read any frames from the video.")
 
-        if clip.audio:
-            final = VideoFileClip(output_path).set_audio(clip.audio)
-            final.write_videofile(output_path, codec="libx264", audio_codec="aac")
-        return output_path
+            new_frames = _video_lsb_embed(frames, message)
 
-    elif technique.lower() == "motionvector":
-        clip = VideoFileClip(video_path)
-        frames = [
-            cv2.cvtColor(np.array(f), cv2.COLOR_RGB2BGR) for f in clip.iter_frames()
-        ]
+            if output_path is None:
+                base = os.path.splitext(os.path.basename(video_path))[0]
+                output_path = f"/tmp/embedded_{base}.mp4"
 
-        cap = cv2.VideoCapture(video_path)
-        new_frames = _video_mv_embed(cap, message)
+            final_clip = ImageSequenceClip(new_frames, fps=fps)
+
+            original_clip = VideoFileClip(video_path)
+            if original_clip.audio:
+                final_clip.audio = original_clip.audio
+
+            final_clip.write_videofile(
+                output_path, codec="libx264", audio_codec="aac", logger=None
+            )
+            return output_path
+
+        elif technique.lower() == "motionvector":
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            new_frames_bgr = _video_mv_embed(cap, message)
+            new_frames_rgb = [
+                cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) for frame in new_frames_bgr
+            ]
+
+            if output_path is None:
+                base = os.path.splitext(os.path.basename(video_path))[0]
+                output_path = f"/tmp/embedded_{base}.mp4"
+            final_clip = ImageSequenceClip(new_frames_rgb, fps=fps)
+            original_clip = VideoFileClip(video_path)
+            if original_clip.audio:
+                final_clip.audio = original_clip.audio
+            final_clip.write_videofile(
+                output_path, codec="libx264", audio_codec="aac", logger=None
+            )
+            return output_path
+        else:
+            raise NotImplementedError(f"Video technique '{technique}' not implemented.")
+    finally:
         cap.release()
-
-        if output_path is None:
-            base = os.path.splitext(os.path.basename(video_path))[0]
-            output_path = f"/tmp/embedded_{base}.mp4"
-
-        height, width, _ = new_frames[0].shape
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(output_path, fourcc, clip.fps, (width, height))
-        for frm in new_frames:
-            out.write(frm)
-        out.release()
-
-        if clip.audio:
-            final = VideoFileClip(output_path).set_audio(clip.audio)
-            final.write_videofile(output_path, codec="libx264", audio_codec="aac")
-        return output_path
-    else:
-        raise NotImplementedError(f"Video technique '{technique}' not implemented.")
+        if original_clip:
+            original_clip.close()
+        if final_clip:
+            final_clip.close()
 
 
 def extract_message_from_video(video_path: str, technique: str) -> bytes:
-    if technique.lower() == "lsb":
-        clip = VideoFileClip(video_path)
-        frames = [
-            cv2.cvtColor(np.array(f), cv2.COLOR_RGB2BGR) for f in clip.iter_frames()
-        ]
-        return _video_lsb_extract(frames)
-    elif technique.lower() == "motionvector":
-        cap = cv2.VideoCapture(video_path)
-        data = _video_mv_extract(cap)
-        cap.release()
-        return data
-    else:
-        raise NotImplementedError(f"Video technique '{technique}' not implemented.")
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError("Could not open video file.")
+    try:
+        if technique.lower() == "lsb":
+            frames = []
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            if not frames:
+                return b""
+            return _video_lsb_extract(frames)
+        elif technique.lower() == "motionvector":
+            return _video_mv_extract(cap)
+        else:
+            raise NotImplementedError(f"Video technique '{technique}' not implemented.")
+    finally:
+        if cap.isOpened():
+            cap.release()
