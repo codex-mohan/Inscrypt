@@ -1,0 +1,40 @@
+name: Greetings 👋
+
+on: [pull_request_target, issues]
+
+jobs:
+  greeting:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/first-interaction@v1
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          issue-message: |
+            🎉 **Welcome to our project, @${{ github.actor }}!** 🎉
+
+            Thanks for opening your very first issue here! 🙌  
+            We’re so excited to have you contributing. 🚀  
+
+            💡 **Next steps:**
+            - Make sure to follow our [contributing guidelines](CONTRIBUTING.md) 📜  
+            - Check existing issues to avoid duplicates 🔍  
+            - Don’t be shy—ask questions if you need help! 💬  
+
+            You’re awesome for helping us make this project better! 💖
+
+          pr-message: |
+            👋 **Hey there, @${{ github.actor }}!** 👋
+
+            Woohoo! 🚀 Thanks for your very first pull request! ✨  
+            We truly appreciate your time and effort in making this project better. 💪  
+
+            🔍 **Next steps:**
+            - A maintainer will review your changes soon 🧐  
+            - Stay tuned for any feedback 💬  
+            - While you wait, check out our [issues list](../../issues) for more ways to contribute 🛠  
+
+            You’re officially part of the contributors’ club! 🎖  
+            **High five! 🙌**
